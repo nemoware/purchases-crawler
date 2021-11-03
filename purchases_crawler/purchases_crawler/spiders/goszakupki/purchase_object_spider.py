@@ -10,7 +10,10 @@ class PurchaseObjectSpider(scrapy.Spider):
     def __init__(self, start_urls, output_file, *args, **kwargs):
         self.output_file = output_file
         self.name = "objects"
-        self.page_number = 1
+        url_parts = list(urllib.parse.urlparse(start_urls[0]))
+        query = dict(urllib.parse.parse_qsl(url_parts[4]))
+        self.page_number = int(query['pageNumber'])
+
         self.start_urls = start_urls
         super(PurchaseObjectSpider, self).__init__(*args, **kwargs)
 
