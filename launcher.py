@@ -9,7 +9,8 @@ from purchases_crawler.purchases_crawler.spiders.goszakupki.purchase_object_spid
 
 def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-u", "--url", help="Start url with search parameters.")
+    required_named = parser.add_argument_group('required named arguments')
+    required_named.add_argument("-u", "--url", help="Start url with search parameters.", required=True)
     parser.add_argument('-o', '--out-file', help='Output file path (objects.yml by default)', action='store', default='objects.yml')
     args = parser.parse_args()
     os.environ['SCRAPY_SETTINGS_MODULE'] = 'purchases_crawler.purchases_crawler.settings'
