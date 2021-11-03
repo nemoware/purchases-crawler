@@ -31,16 +31,16 @@ class PurchaseObjectSpider(scrapy.Spider):
         yield scrapy.Request(urllib.parse.urlunparse(url_parts), callback=self.parse)
 
     def parse_card(self, response):
-        id = response.css('span.cardMainInfo__purchaseLink a::text').get()
+        id = response.css('span.cardMainInfo__purchaseLink a::text').get(default='')
         main_info = response.css('div.sectionMainInfo__body')
-        purchase_object = None
+        purchase_object = ''
         customer = None
         if main_info:
             main_info_sections = main_info.css('div.cardMainInfo__section')
             for main_info_section in main_info_sections:
                 main_info_section_title = main_info_section.css('span.cardMainInfo__title::text').get()
                 if main_info_section_title and 'Объект закупки' in main_info_section_title:
-                    purchase_object = main_info_section.css('span.cardMainInfo__content::text').get()
+                    purchase_object = main_info_section.css('span.cardMainInfo__content::text').get(default='')
                 # if main_info_section_title and customer_pattern.search(main_info_section_title):
                 #     customer = main_info_section.css('span.cardMainInfo__content a::text').get().strip()
 
@@ -92,28 +92,24 @@ class PurchaseObjectSpider(scrapy.Spider):
                 }
                 purchase_positions = self.parse_table(block.css('table.tableBlock'), column_mapping, response.request.url)
 
-        if id is not None and purchase_object is not None:
-            result = {
-                'id': id.replace('№', '').strip(),
-                'url': response.request.url,
-                'object': self.normalize_string(purchase_object),
-                'customer': customer,
-                'placement_date': placement_date,
-                'application_deadline': application_deadline,
-                'region': region,
-                'start_price': start_price,
-                'currency': currency,
-                'purchase_positions': purchase_positions
-            }
-            nav_tabs = response.css('a.tabsNav__item')
-            for nav_link in nav_tabs:
-                if 'Результаты определения поставщика' in nav_link.css('::text').get(default=''):
-                    nav_url = nav_link.css('::attr(href)').get(default=None)
-                    if nav_url:
-                        yield scrapy.Request(response.urljoin(nav_url), callback=self.parse_suppliers, cb_kwargs=dict(result=result))
-
-        else:
-            logging.error(f'Can not parse purchase: {response.request.url}')
+        result = {
+            'id': id.replace('№', '').strip(),
+            'url': response.request.url,
+            'object': self.normalize_string(purchase_object),
+            'customer': customer,
+            'placement_date': placement_date,
+            'application_deadline': application_deadline,
+            'region': region,
+            'start_price': start_price,
+            'currency': currency,
+            'purchase_positions': purchase_positions
+        }
+        nav_tabs = response.css('a.tabsNav__item')
+        for nav_link in nav_tabs:
+            if 'Результаты определения поставщика' in nav_link.css('::text').get(default=''):
+                nav_url = nav_link.css('::attr(href)').get(default=None)
+                if nav_url:
+                    yield scrapy.Request(response.urljoin(nav_url), callback=self.parse_suppliers, cb_kwargs=dict(result=result))
 
     def parse_suppliers(self, response, result):
         supplier_div = response.css('div[id^=supplier-def-result-participant-table]')
@@ -147,7 +143,7 @@ class PurchaseObjectSpider(scrapy.Spider):
                 else:
                     excluded_idx.append(idx)
                     if column_header_text.strip() != '':
-                        logging.warning(f'Column mapping not found: {column_header_text} URL: {url}')
+                        logging.debug(f'Column mapping not found: {column_header_text} URL: {url}')
             tbody = table.css('tbody.tableBlock__body')
             rows = tbody.css('tr.tableBlock__row, table')
             for row in rows:
@@ -162,7 +158,7 @@ class PurchaseObjectSpider(scrapy.Spider):
                         record[name] = self.normalize_string(' '.join(values))
                     else:
                         if idx not in excluded_idx:
-                            logging.warning(f'Column name for index {idx} not found. URL: {url}')
+                            logging.debug(f'Column name for index {idx} not found. URL: {url}')
                 result.append(record)
         return result
 
