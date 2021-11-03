@@ -1,0 +1,2 @@
+scrapy==2.5.0
+ruamel.yaml==0.17.16
