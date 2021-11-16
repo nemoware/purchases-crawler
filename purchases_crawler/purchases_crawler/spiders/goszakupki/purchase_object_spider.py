@@ -1,37 +1,79 @@
+import datetime
 import logging
 import re
 import urllib.parse
+from typing import Optional
 
 import scrapy
 normalization_pattern = re.compile(r'\s+|\r|\n|\r\n')
 
 
 class PurchaseObjectSpider(scrapy.Spider):
+    RECORDS_PER_PAGE = 500
+    MAX_ITEMS_PER_SEARCH = 4000
+    PRICE_INTERVALS = [(0, 1000), (1001, 1000000), (1000001, 1000000000), (1000000001, 1000000000000000)]
+
     def __init__(self, start_urls, output_file, *args, **kwargs):
         self.output_file = output_file
         self.name = "objects"
-        url_parts = list(urllib.parse.urlparse(start_urls[0]))
-        query = dict(urllib.parse.parse_qsl(url_parts[4]))
-        self.page_number = int(query['pageNumber'])
-
+        self.page_number = int(self.get_url_param(start_urls[0], 'pageNumber'))
         self.start_urls = start_urls
+        self.placement_date = datetime.date.today()
+        self.current_intervals = self.PRICE_INTERVALS.copy()
+        self.found_cards = dict()
         super(PurchaseObjectSpider, self).__init__(*args, **kwargs)
+
+    def get_new_search_url(self, url):
+        if len(self.current_intervals) == 0:
+            self.current_intervals = self.PRICE_INTERVALS.copy()
+            self.placement_date = self.placement_date - datetime.timedelta(days=1)
+            logging.info("New search placement date: " + self.placement_date.strftime('%d.%m.%Y'))
+            logging.info('New intervals: ' + str(self.current_intervals))
+        self.page_number = 1
+        interval = self.current_intervals.pop()
+        return self.set_url_param(url, {'priceFromGeneral': str(interval[0]), 'priceToGeneral': str(interval[1]),
+                                 'publishDateFrom': self.placement_date.strftime('%d.%m.%Y'),
+                                 'publishDateTo': self.placement_date.strftime('%d.%m.%Y'),
+                                 'pageNumber': str(self.page_number), 'recordsPerPage': str(self.RECORDS_PER_PAGE)})
+
+    def set_url_param(self, url: str, values: {str, str}) -> str:
+        url_parts = list(urllib.parse.urlparse(url))
+        query = dict(urllib.parse.parse_qsl(url_parts[4]))
+        query.update(values)
+        url_parts[4] = urllib.parse.urlencode(query)
+        return urllib.parse.urlunparse(url_parts)
+
+    def get_url_param(self, url: str, key: str) -> Optional[str]:
+        url_parts = list(urllib.parse.urlparse(url))
+        query = dict(urllib.parse.parse_qsl(url_parts[4]))
+        return query[key]
 
     def parse(self, response):
         purchases = response.css('div.registry-entry__form')
-        if len(purchases) == 0:
+        result_number = int(re.findall(r'[\d]+', re.sub(r'\s', '', response.css('div.search-results__total::text').get().strip()))[0])
+        if result_number > self.MAX_ITEMS_PER_SEARCH:
+            price_to = int(self.get_url_param(response.request.url, 'priceToGeneral'))
+            self.current_intervals.append((price_to // 2 + 1, price_to))
+            logging.info('New intervals: ' + str(self.current_intervals))
+            search_url = self.set_url_param(response.request.url, {'priceToGeneral': str(price_to // 2)})
+            yield scrapy.Request(search_url, callback=self.parse)
             return
-        for purchase in response.css('div.registry-entry__form'):
+        logging.info(f'Result number: {result_number} Result on page: {len(purchases)} URL: {response.request.url}')
+        for purchase in purchases:
             url = purchase.css('div.registry-entry__header-mid__number a::attr(href)').get()
+            # card_number = self.get_url_param(url, 'regNumber')
+            # if card_number in self.found_cards.keys():
+            #     logging.info(f'Card already found: {card_number}. Previously found on: {self.found_cards[card_number]}')
+            # else:
+            #     self.found_cards[card_number] = response.request.url
             yield scrapy.Request(response.urljoin(url), callback=self.parse_card)
-
-        self.page_number += 1
-        url_parts = list(urllib.parse.urlparse(self.start_urls[0]))
-        query = dict(urllib.parse.parse_qsl(url_parts[4]))
-        query['pageNumber'] = str(self.page_number)
-        url_parts[4] = urllib.parse.urlencode(query)
-
-        yield scrapy.Request(urllib.parse.urlunparse(url_parts), callback=self.parse)
+        if len(purchases) < self.RECORDS_PER_PAGE:
+            search_url = self.get_new_search_url(response.request.url)
+            yield scrapy.Request(search_url, callback=self.parse)
+        else:
+            self.page_number += 1
+            url = self.set_url_param(response.request.url, {'pageNumber': str(self.page_number)})
+            yield scrapy.Request(url, callback=self.parse)
 
     def parse_card(self, response):
         id = response.css('span.cardMainInfo__purchaseLink a::text').get(default='')
@@ -94,6 +136,10 @@ class PurchaseObjectSpider(scrapy.Spider):
                     'Стоимость, ₽': 'total_price',
                 }
                 purchase_positions = self.parse_table(block.css('table.tableBlock'), column_mapping, response.request.url)
+                for position in purchase_positions:
+                    position['quantity'] = self.parse_number(position.get('quantity'))
+                    position['price_per_unit'] = self.parse_number(position.get('price_per_unit'))
+                    position['total_price'] = self.parse_number(position.get('total_price'))
 
         result = {
             'id': id.replace('№', '').strip(),
@@ -103,7 +149,7 @@ class PurchaseObjectSpider(scrapy.Spider):
             'placement_date': placement_date,
             'application_deadline': application_deadline,
             'region': region,
-            'start_price': start_price,
+            'start_price': self.parse_number(start_price),
             'currency': currency,
             'purchase_positions': purchase_positions
         }
@@ -126,6 +172,8 @@ class PurchaseObjectSpider(scrapy.Spider):
                 'Предложение участника, ₽': 'offer',
             }
             suppliers = self.parse_table(supplier_div.css('table'), column_mapping, response.request.url)
+            for supplier in suppliers:
+                supplier['offer'] = self.parse_number(supplier.get('offer'))
             result['suppliers'] = suppliers
         yield result
 
@@ -165,5 +213,10 @@ class PurchaseObjectSpider(scrapy.Spider):
                 result.append(record)
         return result
 
-    def normalize_string(self, input) -> str:
-        return normalization_pattern.sub(' ', input).strip()
+    def normalize_string(self, input_str: str) -> str:
+        return normalization_pattern.sub(' ', input_str).strip()
+
+    def parse_number(self, input_str: str) -> Optional[float]:
+        if not input_str:
+            return None
+        return float(re.sub(r',', '.', re.findall(r'[-+]?\d*[.,]\d+|\d+', re.sub(r'\s', '', input_str.strip()))[0]))
