@@ -5,36 +5,38 @@ import urllib.parse
 from typing import Optional
 
 import scrapy
+from pymongo import MongoClient
+
 normalization_pattern = re.compile(r'\s+|\r|\n|\r\n')
 
 
 class PurchaseObjectSpider(scrapy.Spider):
     RECORDS_PER_PAGE = 500
     MAX_ITEMS_PER_SEARCH = 4000
-    PRICE_INTERVALS = [(0, 1000), (1001, 1000000), (1000001, 1000000000), (1000000001, 1000000000000000)]
+    PRICE_INTERVALS = [(0, 1000), (1001, 1000000), (1000001, 1000000000)]
 
-    def __init__(self, start_urls, output_file, *args, **kwargs):
-        self.output_file = output_file
+    def __init__(self, start_urls, connection_string, *args, **kwargs):
+        self.connection_string = connection_string
         self.name = "objects"
-        self.page_number = int(self.get_url_param(start_urls[0], 'pageNumber'))
-        self.start_urls = start_urls
-        self.placement_date = datetime.date.today()
-        self.current_intervals = self.PRICE_INTERVALS.copy()
-        self.found_cards = dict()
+        self.start_urls = self.generate_urls(start_urls[0], datetime.datetime.today(), datetime.datetime.strptime('2013-04-01', '%Y-%m-%d'))
+        self.client = MongoClient(connection_string)
+        self.collection = self.client.get_database()['purchases']
         super(PurchaseObjectSpider, self).__init__(*args, **kwargs)
 
-    def get_new_search_url(self, url):
-        if len(self.current_intervals) == 0:
-            self.current_intervals = self.PRICE_INTERVALS.copy()
-            self.placement_date = self.placement_date - datetime.timedelta(days=1)
-            logging.info("New search placement date: " + self.placement_date.strftime('%d.%m.%Y'))
-            logging.info('New intervals: ' + str(self.current_intervals))
-        self.page_number = 1
-        interval = self.current_intervals.pop()
-        return self.set_url_param(url, {'priceFromGeneral': str(interval[0]), 'priceToGeneral': str(interval[1]),
-                                 'publishDateFrom': self.placement_date.strftime('%d.%m.%Y'),
-                                 'publishDateTo': self.placement_date.strftime('%d.%m.%Y'),
-                                 'pageNumber': str(self.page_number), 'recordsPerPage': str(self.RECORDS_PER_PAGE)})
+    def generate_urls(self, url, start_date, end_date):
+        placement_date = start_date
+        while placement_date >= end_date:
+            search_url = self.get_new_search_url(url, placement_date)
+            placement_date -= datetime.timedelta(days=1)
+            yield search_url
+
+    def get_new_search_url(self, url, placement_date):
+        logging.info("New search placement date: " + placement_date.strftime('%d.%m.%Y'))
+        # logging.info('New intervals: ' + str(self.current_intervals))
+        return self.set_url_param(url, {'priceFromGeneral': '1000000001', 'priceToGeneral': '1000000000000000',
+                                 'publishDateFrom': placement_date.strftime('%d.%m.%Y'),
+                                 'publishDateTo': placement_date.strftime('%d.%m.%Y'),
+                                 'pageNumber': '1', 'recordsPerPage': str(self.RECORDS_PER_PAGE)})
 
     def set_url_param(self, url: str, values: {str, str}) -> str:
         url_parts = list(urllib.parse.urlparse(url))
@@ -48,32 +50,35 @@ class PurchaseObjectSpider(scrapy.Spider):
         query = dict(urllib.parse.parse_qsl(url_parts[4]))
         return query[key]
 
-    def parse(self, response):
+    def parse(self, response, current_intervals=None):
+        page_number = 1
+        if current_intervals is None:
+            current_intervals = self.PRICE_INTERVALS.copy()
+        if len(current_intervals) > 0:
+            interval = current_intervals.pop()
+            url = self.set_url_param(response.request.url, {'priceFromGeneral': str(interval[0]), 'priceToGeneral': str(interval[1])})
+            yield scrapy.Request(url, callback=self.parse, cb_kwargs=dict(current_intervals=current_intervals))
         purchases = response.css('div.registry-entry__form')
         result_number = int(re.findall(r'[\d]+', re.sub(r'\s', '', response.css('div.search-results__total::text').get().strip()))[0])
         if result_number > self.MAX_ITEMS_PER_SEARCH:
             price_to = int(self.get_url_param(response.request.url, 'priceToGeneral'))
-            self.current_intervals.append((price_to // 2 + 1, price_to))
-            logging.info('New intervals: ' + str(self.current_intervals))
+            current_intervals.append((price_to // 2 + 1, price_to))
+            logging.info('New intervals: ' + str(current_intervals))
             search_url = self.set_url_param(response.request.url, {'priceToGeneral': str(price_to // 2)})
-            yield scrapy.Request(search_url, callback=self.parse)
+            yield scrapy.Request(search_url, callback=self.parse, cb_kwargs=dict(current_intervals=current_intervals))
             return
         logging.info(f'Result number: {result_number} Result on page: {len(purchases)} URL: {response.request.url}')
         for purchase in purchases:
             url = purchase.css('div.registry-entry__header-mid__number a::attr(href)').get()
-            # card_number = self.get_url_param(url, 'regNumber')
-            # if card_number in self.found_cards.keys():
-            #     logging.info(f'Card already found: {card_number}. Previously found on: {self.found_cards[card_number]}')
-            # else:
-            #     self.found_cards[card_number] = response.request.url
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_card)
+            reg_number = self.get_url_param(url, 'regNumber')
+            if self.collection.count_documents({'id': reg_number}, limit=1) == 0:
+                yield scrapy.Request(response.urljoin(url), callback=self.parse_card)
         if len(purchases) < self.RECORDS_PER_PAGE:
-            search_url = self.get_new_search_url(response.request.url)
-            yield scrapy.Request(search_url, callback=self.parse)
+            return
         else:
-            self.page_number += 1
-            url = self.set_url_param(response.request.url, {'pageNumber': str(self.page_number)})
-            yield scrapy.Request(url, callback=self.parse)
+            page_number += 1
+            url = self.set_url_param(response.request.url, {'pageNumber': str(page_number)})
+            yield scrapy.Request(url, callback=self.parse, cb_kwargs=dict(current_intervals=current_intervals))
 
     def parse_card(self, response):
         id = response.css('span.cardMainInfo__purchaseLink a::text').get(default='')
